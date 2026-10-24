@@ -256,4 +256,3 @@ elif st.session_state.role == "admin":
     st.sidebar.info("管理员端：处理待回答问题、维护知识库、批量导入题库")
     if st.sidebar.button("退出登录"):
         logout()
-
