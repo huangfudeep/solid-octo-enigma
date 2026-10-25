@@ -15,6 +15,13 @@ from openai import OpenAI
 load_dotenv()
 
 DB_URL = os.getenv("SUPABASE_DB_URL", "").strip()
+# Optional split connection settings avoid URL parsing issues when passwords contain
+# reserved characters such as @, :, /, #, or brackets.
+DB_HOST = os.getenv("SUPABASE_DB_HOST", "").strip()
+DB_PORT = os.getenv("SUPABASE_DB_PORT", "5432").strip()
+DB_NAME = os.getenv("SUPABASE_DB_NAME", "postgres").strip()
+DB_USER = os.getenv("SUPABASE_DB_USER", "").strip()
+DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD", "")
 THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.70"))
 LLM_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 LLM_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -31,9 +38,22 @@ _embedding_model = None
 
 
 def _connect():
+    # Prefer discrete settings: psycopg2 receives the password as a separate value,
+    # so special characters do not get misinterpreted as URL delimiters.
+    if DB_HOST and DB_USER and DB_PASSWORD:
+        return psycopg2.connect(
+            host=DB_HOST,
+            port=int(DB_PORT or "5432"),
+            dbname=DB_NAME or "postgres",
+            user=DB_USER,
+            password=DB_PASSWORD,
+            connect_timeout=15,
+            cursor_factory=RealDictCursor,
+            sslmode="require",
+        )
     if not DB_URL:
         raise RuntimeError(
-            "未配置 SUPABASE_DB_URL。请在 Streamlit Cloud → Settings → Secrets 中添加 Supabase PostgreSQL 连接字符串。"
+            "未配置数据库连接信息。请在 Streamlit Cloud → Settings → Secrets 中设置 SUPABASE_DB_HOST、SUPABASE_DB_USER、SUPABASE_DB_PASSWORD 等字段，或设置 SUPABASE_DB_URL。"
         )
     return psycopg2.connect(DB_URL, connect_timeout=15, cursor_factory=RealDictCursor, sslmode="require")
 

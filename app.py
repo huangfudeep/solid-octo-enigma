@@ -15,7 +15,8 @@ try:
         "OPENAI_API_KEY", "OPENAI_BASE_URL", "CHAT_MODEL", "EMBED_PROVIDER",
         "EMBED_MODEL", "EMBED_DIMENSIONS", "EMBED_INSTRUCTIONS",
         "LOCAL_EMBED_MODEL", "SIMILARITY_THRESHOLD", "DB_PATH", "CHROMA_DIR",
-        "SUPABASE_DB_URL", "ADMIN_PASSWORD",
+        "SUPABASE_DB_URL", "SUPABASE_DB_HOST", "SUPABASE_DB_PORT",
+        "SUPABASE_DB_NAME", "SUPABASE_DB_USER", "SUPABASE_DB_PASSWORD", "ADMIN_PASSWORD",
     ):
         if _key in st.secrets and _key not in os.environ:
             os.environ[_key] = str(st.secrets[_key])
