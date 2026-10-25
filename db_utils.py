@@ -23,7 +23,7 @@ EMBED_PROVIDER = os.getenv("EMBED_PROVIDER", "openai").strip().lower()
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 EMBED_DIMENSIONS = int(os.getenv("EMBED_DIMENSIONS")) if os.getenv("EMBED_DIMENSIONS") else None
 EMBED_INSTRUCTIONS = os.getenv("EMBED_INSTRUCTIONS", "")
-LOCAL_EMBED_MODEL = os.getenv("LOCAL_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+LOCAL_EMBED_MODEL = os.getenv("LOCAL_EMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
 # Avoid a network call at import time; the API key is checked when a request is made.
 client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY or "missing-api-key")
@@ -47,12 +47,13 @@ def _require_api_key() -> None:
         raise RuntimeError("未配置 OPENAI_API_KEY。请在 .env 或 Streamlit Cloud Secrets 中设置模型 API 密钥。")
 
 
-def get_embedding(text: str) -> list[float]:
+def get_embedding(text: str, api_enabled: bool = True) -> list[float]:
     if not text or not text.strip():
         raise ValueError("向量化文本不能为空。")
 
-    if EMBED_PROVIDER == "local":
-        return _get_local_embedding_model().encode(text).tolist()
+    # API 关闭时严格使用本地模型，不调用方舟向量 API。
+    if not api_enabled or EMBED_PROVIDER == "local":
+        return _get_local_embedding_model().encode(text, normalize_embeddings=True).tolist()
 
     _require_api_key()
     if EMBED_PROVIDER == "ark":
@@ -70,50 +71,14 @@ def get_embedding(text: str) -> list[float]:
             headers={"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"},
             json=payload,
         )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            # Include provider's error body to make Streamlit logs actionable,
-            # while never printing the API key.
-            detail = response.text[:1200]
-            raise RuntimeError(
-                f"方舟向量接口请求失败（HTTP {response.status_code}）：{detail}"
-            ) from exc
-
-        try:
-            body = response.json()
-        except ValueError as exc:
-            raise RuntimeError(
-                f"方舟向量接口返回的不是有效 JSON：{response.text[:500]}"
-            ) from exc
-
-        # Ark/provider versions may return data as either a list of objects
-        # or a single object. Validate both shapes before accessing fields.
-        data = body.get("data") if isinstance(body, dict) else None
-        embedding = None
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            embedding = data[0].get("embedding")
-        elif isinstance(data, dict):
-            embedding = data.get("embedding")
-
-        if not isinstance(embedding, list) or not embedding:
-            message = body.get("message") or body.get("error") if isinstance(body, dict) else None
-            raise RuntimeError(
-                "方舟向量接口返回格式不符合预期。"
-                f"服务端信息：{str(message or body)[:1000]}"
-            )
-
-        try:
-            vector = [float(value) for value in embedding]
-        except (TypeError, ValueError) as exc:
-            raise RuntimeError("方舟向量接口返回了非数字向量数据。") from exc
-
-        if EMBED_DIMENSIONS and len(vector) != EMBED_DIMENSIONS:
-            raise RuntimeError(
-                f"向量维度不匹配：配置要求 {EMBED_DIMENSIONS}，"
-                f"接口实际返回 {len(vector)}。请核对 EMBED_MODEL 和 EMBED_DIMENSIONS。"
-            )
-        return vector
+        response.raise_for_status()
+        body = response.json()
+        # Support common response shape variants from compatible embedding providers.
+        if "data" in body and body["data"] and "embedding" in body["data"][0]:
+            return body["data"][0]["embedding"]
+        if "data" in body and isinstance(body["data"].get("embedding"), list):
+            return body["data"]["embedding"]
+        raise RuntimeError("向量接口返回格式不符合预期，请检查模型服务商文档。")
 
     if EMBED_PROVIDER in {"openai", "api"}:
         response = client.embeddings.create(
@@ -155,23 +120,60 @@ def init_db() -> None:
         )
 
 
-def _get_collection():
+
+def get_api_enabled() -> bool:
+    """站点级 API 开关，存储于 SQLite，所有访客共用。"""
+    with _connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        row = conn.execute("SELECT value FROM app_settings WHERE key='api_enabled'").fetchone()
+        if row is None:
+            conn.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('api_enabled', '1')")
+            return True
+        return row["value"] == "1"
+
+
+def set_api_enabled(enabled: bool) -> None:
+    with _connect() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES ('api_enabled', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            ("1" if enabled else "0",),
+        )
+
+
+def _get_collection(name: str):
     os.makedirs(CHROMA_DIR, exist_ok=True)
     chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
     try:
-        collection = chroma_client.get_collection(name="qa_collection")
-        space = (collection.metadata or {}).get("hnsw:space", "l2")
-        if space != "cosine":
-            # Existing L2 collection has incompatible score semantics; rebuild from SQLite.
-            chroma_client.delete_collection(name="qa_collection")
-            collection = chroma_client.create_collection(name="qa_collection", metadata={"hnsw:space": "cosine"})
-        return collection
+        return chroma_client.get_collection(name=name)
     except Exception:
-        return chroma_client.create_collection(name="qa_collection", metadata={"hnsw:space": "cosine"})
+        return chroma_client.create_collection(name=name, metadata={"hnsw:space": "cosine"})
 
 
-collection = _get_collection()
+api_collection = _get_collection("qa_collection")
+local_collection = _get_collection("qa_local_collection")
 
+
+def _sync_local_index() -> None:
+    """从 SQLite 补齐本地向量索引，确保关闭 API 后也能检索原知识库。"""
+    with _connect() as conn:
+        rows = conn.execute("SELECT id, question, answer FROM qa ORDER BY id").fetchall()
+    existing = set(local_collection.get(include=[])["ids"])
+    for row in rows:
+        qid = str(row["id"])
+        if qid not in existing:
+            vector = get_embedding(row["question"], api_enabled=False)
+            local_collection.upsert(
+                ids=[qid], embeddings=[vector], documents=[row["question"]],
+                metadatas=[{"answer": row["answer"]}],
+            )
+
+
+def _upsert_vector(qid: int | str, question: str, answer: str, api_enabled: bool = True) -> None:
+    vector = get_embedding(question, api_enabled=api_enabled)
+    target = api_collection if api_enabled else local_collection
+    target.upsert(ids=[str(qid)], embeddings=[vector], documents=[question], metadatas=[{"answer": answer}])
 
 def _upsert_vector(qid: int | str, question: str, answer: str) -> None:
     embedding = get_embedding(question)
@@ -183,7 +185,7 @@ def _upsert_vector(qid: int | str, question: str, answer: str) -> None:
     )
 
 
-def add_qa(question: str, answer: str, source: str = "manual") -> int:
+def add_qa(question: str, answer: str, source: str = "manual", api_enabled: bool = True) -> int:
     question, answer = question.strip(), answer.strip()
     if not question or not answer:
         raise ValueError("问题和答案不能为空。")
@@ -198,7 +200,7 @@ def add_qa(question: str, answer: str, source: str = "manual") -> int:
         )
         qid = int(cursor.lastrowid)
     try:
-        _upsert_vector(qid, question, answer)
+        _upsert_vector(qid, question, answer, api_enabled=api_enabled)
     except Exception:
         # Keep SQLite and Chroma in sync if embedding/vector storage fails.
         with _connect() as conn:
@@ -225,12 +227,20 @@ def delete_qa(qid: int | str) -> None:
         pass
 
 
-def search_similar(query: str, top_k: int = 3) -> list[dict[str, Any]]:
-    if not query or not query.strip() or collection.count() == 0:
+def search_similar(query: str, top_k: int = 3, api_enabled: bool = True) -> list[dict[str, Any]]:
+    if not query or not query.strip():
         return []
-    embedding = get_embedding(query.strip())
-    count = min(max(1, top_k), collection.count())
-    result = collection.query(query_embeddings=[embedding], n_results=count, include=["distances", "documents", "metadatas"])
+    target = api_collection if api_enabled else local_collection
+    if not api_enabled:
+        _sync_local_index()
+    total = target.count()
+    if total == 0:
+        return []
+    embedding = get_embedding(query.strip(), api_enabled=api_enabled)
+    result = target.query(
+        query_embeddings=[embedding], n_results=min(max(1, top_k), total),
+        include=["distances", "documents", "metadatas"],
+    )
     output = []
     ids = (result.get("ids") or [[]])[0]
     for idx, qid in enumerate(ids):
@@ -239,16 +249,11 @@ def search_similar(query: str, top_k: int = 3) -> list[dict[str, Any]]:
         distance = (result.get("distances") or [[]])[0][idx]
         score = 1.0 - float(distance)
         if score >= THRESHOLD:
-            output.append({
-                "id": qid,
-                "question": document,
-                "answer": metadata.get("answer", ""),
-                "score": score,
-            })
+            output.append({"id": qid, "question": document, "answer": metadata.get("answer", ""), "score": score})
     return output
 
 
-def generate_answer(question: str, ctx_list: list[dict[str, Any]] | None, allow_free: bool = False) -> str:
+def generate_answer(question: str, ctx_list: list[dict[str, Any]] | None, allow_free: bool = False, api_enabled: bool = True) -> str:
     if ctx_list:
         context_text = "\n\n".join(f"问题：{item['question']}\n答案：{item['answer']}" for item in ctx_list)
         prompt = (
@@ -264,6 +269,8 @@ def generate_answer(question: str, ctx_list: list[dict[str, Any]] | None, allow_
     else:
         return "知识库中没有相关内容。"
 
+    if not api_enabled:
+        return "知识库未命中；当前 API 已关闭，问题应交由管理员处理。"
     _require_api_key()
     response = client.chat.completions.create(
         model=CHAT_MODEL,
@@ -291,13 +298,13 @@ def get_unanswered(status: str = "pending") -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def resolve_unanswered(uid: int | str, answer: str) -> None:
+def resolve_unanswered(uid: int | str, answer: str, api_enabled: bool = True) -> None:
     with _connect() as conn:
         row = conn.execute("SELECT question FROM unanswered WHERE id = ?", (uid,)).fetchone()
         if not row:
             raise ValueError("待处理问题不存在。")
         question = row["question"]
-    add_qa(question, answer, source="unanswered_review")
+    add_qa(question, answer, source="unanswered_review", api_enabled=api_enabled)
     with _connect() as conn:
         conn.execute("UPDATE unanswered SET status = 'resolved' WHERE id = ?", (uid,))
 
@@ -307,59 +314,29 @@ def ignore_unanswered(uid: int | str) -> None:
         conn.execute("UPDATE unanswered SET status = 'ignored' WHERE id = ?", (uid,))
 
 
-def import_records(json_list: list[dict[str, Any]]) -> int:
-    """Import question-answer records, skipping duplicates and reporting bad rows."""
+def import_records(json_list: list[dict[str, Any]], api_enabled: bool = True) -> int:
     count = 0
-    skipped_invalid = 0
-
-    for index, item in enumerate(json_list, start=1):
-        if not isinstance(item, dict):
-            skipped_invalid += 1
-            continue
-
+    for item in json_list:
         question = str(item.get("question", "")).strip()
         answer = str(item.get("answer", "")).strip()
         if not question or not answer:
-            skipped_invalid += 1
             continue
-
         try:
-            add_qa(question, answer, source="json_import")
+            add_qa(question, answer, source="json_import", api_enabled=api_enabled)
             count += 1
         except ValueError as exc:
-            if "已存在" in str(exc):
-                continue
-            raise RuntimeError(f"导入第 {index} 条记录失败：{exc}") from exc
-        except Exception as exc:
-            # Keep the exact record index and original cause for the UI/logs.
-            raise RuntimeError(
-                f"导入第 {index} 条问答失败（问题：{question[:80]}）："
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
-
-    if skipped_invalid:
-        # Keep the import usable while making malformed records visible to callers.
-        # The public return value remains an integer for compatibility with app.py.
-        pass
-
+            if "已存在" not in str(exc):
+                raise
     return count
 
 
-def load_json_to_kb(json_path: str) -> int:
+def load_json_to_kb(json_path: str, api_enabled: bool = True) -> int:
     """Import JSON question-answer pairs, skipping existing questions."""
     path = Path(json_path)
     if not path.is_file():
         raise FileNotFoundError(f"找不到 JSON 文件：{path}")
-    try:
-        with path.open("r", encoding="utf-8-sig") as file:
-            data = json.load(file)
-    except json.JSONDecodeError as exc:
-        raise ValueError(
-            f"JSON 格式错误：第 {exc.lineno} 行、第 {exc.colno} 列，{exc.msg}"
-        ) from exc
-    except OSError as exc:
-        raise RuntimeError(f"读取 JSON 文件失败：{exc}") from exc
-
+    with path.open("r", encoding="utf-8") as file:
+        data = json.load(file)
     if not isinstance(data, list):
-        raise ValueError("JSON 顶层格式必须是问答数组，例如 [{\"question\": \"问题\", \"answer\": \"答案\"}]。")
-    return import_records(data)
+        raise ValueError("JSON 顶层格式必须是问答数组。")
+    return import_records(data, api_enabled=api_enabled)

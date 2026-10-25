@@ -17,8 +17,7 @@ try:
         "LOCAL_EMBED_MODEL", "SIMILARITY_THRESHOLD", "DB_PATH", "CHROMA_DIR",
         "ADMIN_PASSWORD",
     ):
-        if _key in st.secrets:
-            # Streamlit Cloud Secrets 优先级高于本地环境变量/.env
+        if _key in st.secrets and _key not in os.environ:
             os.environ[_key] = str(st.secrets[_key])
 except Exception:
     # Local run without a Streamlit secrets file is expected.
@@ -30,6 +29,7 @@ from db_utils import (
     delete_qa,
     generate_answer,
     get_all_qa,
+    get_api_enabled,
     get_unanswered,
     ignore_unanswered,
     init_db,
@@ -37,6 +37,7 @@ from db_utils import (
     record_unanswered,
     resolve_unanswered,
     search_similar,
+    set_api_enabled,
 )
 
 # Streamlit Cloud Secrets 优先，其次读取环境变量/.env。
@@ -68,28 +69,32 @@ def logout() -> None:
 
 
 def answer_question(question: str, *, student: bool) -> None:
-    """优先返回超过相似度阈值的知识库答案；未命中时记录待处理问题。"""
+    """先检索知识库；未命中则提交管理员，只有 API 开启时才调用大模型。"""
+    api_enabled = get_api_enabled()
     try:
-        matches = search_similar(question)
+        matches = search_similar(question, api_enabled=api_enabled)
         if matches:
             best = matches[0]
-            st.markdown("### 回答")
+            st.markdown("### 知识库回答")
             st.markdown(best["answer"])
             st.caption(f"知识库匹配度：{best['score']:.0%}")
             with st.expander("查看匹配到的知识库问题"):
                 st.write(best["question"])
             return
-
         if student:
             record_unanswered(question)
-        with st.spinner("正在生成临时回答…"):
-            answer = generate_answer(question, [], allow_free=True)
-        st.markdown("### 临时回答")
-        st.markdown(answer)
-        st.info("该回答尚未经过管理员确认，请以赛事群和官方通知为准。问题已提交管理员处理。" if student else "这是临时回答，尚未加入知识库。")
+        if api_enabled:
+            with st.spinner("正在生成临时回答…"):
+                answer = generate_answer(question, [], allow_free=True, api_enabled=True)
+            st.markdown("### 临时回答")
+            st.markdown(answer)
+            st.info("该回答尚未经过管理员确认。问题已提交管理员处理。")
+        else:
+            st.warning("知识库中暂时没有找到合适答案。")
+            st.info("问题已提交管理员待处理；当前已关闭方舟 API，不会调用向量或聊天接口。")
     except Exception as exc:
         st.error(f"处理问题时发生错误：{exc}")
-        st.caption("请检查 Streamlit Secrets 中的模型 API、向量模型和网络配置。")
+        st.caption("若已关闭 API，请检查本地向量模型依赖；开启 API 时请检查 Secrets 配置。")
 
 
 # 身份选择
@@ -149,6 +154,19 @@ elif st.session_state.role == "student":
 # 管理员后台
 elif st.session_state.role == "admin":
     st.title("🔐 管理员后台")
+    current_api_enabled = get_api_enabled()
+    api_enabled_ui = st.toggle(
+        "启用方舟 API（向量检索 + 大模型临时回答）",
+        value=current_api_enabled,
+        key="admin_api_toggle",
+        help="关闭后所有访客改用本地向量模型；未命中只提交管理员，不调用方舟 API。",
+    )
+    if api_enabled_ui != current_api_enabled:
+        set_api_enabled(api_enabled_ui)
+        st.success("已开启方舟 API。" if api_enabled_ui else "已关闭方舟 API，切换到本地检索。")
+        st.rerun()
+    st.caption("当前模式：" + ("方舟 API 已开启" if current_api_enabled else "本地检索模式（不调用方舟 API）"))
+
     tab_test, tab_pending, tab_kb = st.tabs(["问答测试", "待回答问题处理", "知识库管理"])
 
     with tab_test:
@@ -178,7 +196,7 @@ elif st.session_state.role == "admin":
                     if save_clicked:
                         if new_answer.strip():
                             try:
-                                resolve_unanswered(item["id"], new_answer.strip())
+                                resolve_unanswered(item["id"], new_answer.strip(), api_enabled=get_api_enabled())
                                 st.success("已保存到知识库！")
                                 st.rerun()
                             except Exception as exc:
@@ -198,7 +216,7 @@ elif st.session_state.role == "admin":
         if add_clicked:
             if question_add.strip() and answer_add.strip():
                 try:
-                    add_qa(question_add.strip(), answer_add.strip(), source="manual")
+                    add_qa(question_add.strip(), answer_add.strip(), source="manual", api_enabled=get_api_enabled())
                     st.success("添加成功")
                     st.rerun()
                 except Exception as exc:
@@ -209,32 +227,15 @@ elif st.session_state.role == "admin":
         st.divider()
         st.subheader("批量导入示例题库")
         if st.button("📥 一键导入 sample_qa.json"):
-            if not SAMPLE_JSON.is_file():
-                st.error(
-                    f"找不到题库文件：{SAMPLE_JSON.name}。"
-                    "请确认 sample_qa.json 已与 app.py 一起提交到 GitHub 仓库。"
-                )
+            if not SAMPLE_JSON.exists():
+                st.error(f"找不到文件：{SAMPLE_JSON.name}。请确认该文件已和 app.py 一起部署。")
             else:
                 try:
-                    with st.spinner("正在读取题库并生成向量，请稍候…"):
-                        count = load_json_to_kb(str(SAMPLE_JSON))
-                    if count:
-                        st.success(f"导入完成！本次新增 {count} 条问答，重复的问题已自动跳过。")
-                    else:
-                        st.warning(
-                            "导入流程已完成，但新增 0 条。可能是题库问题已全部存在，"
-                            "或 JSON 中没有同时包含非空 question 和 answer 的条目。"
-                        )
+                    count = load_json_to_kb(str(SAMPLE_JSON), api_enabled=get_api_enabled())
+                    st.success(f"导入完成！新增 {count} 条问答，重复的问题会自动跳过。")
                     st.rerun()
-                except FileNotFoundError as exc:
-                    st.error(f"找不到题库文件：{exc}")
                 except Exception as exc:
-                    st.error(f"导入失败：{type(exc).__name__}: {exc}")
-                    st.info(
-                        "如果错误涉及 API 或向量模型，请检查 Secrets 中的 "
-                        "OPENAI_API_KEY、OPENAI_BASE_URL、EMBED_PROVIDER、EMBED_MODEL "
-                        "和 EMBED_DIMENSIONS 是否与方舟控制台配置一致。"
-                    )
+                    st.error(f"导入失败：{exc}")
 
         st.subheader("现有知识库")
         all_items = get_all_qa()
