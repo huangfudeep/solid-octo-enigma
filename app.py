@@ -69,29 +69,47 @@ def logout() -> None:
 
 
 def answer_question(question: str, *, student: bool) -> None:
-    """先检索知识库；未命中则提交管理员，只有 API 开启时才调用大模型。"""
+    """学生优先展示最高相似度答案；未达阈值时提交管理员待办。"""
     api_enabled = get_api_enabled()
     try:
-        matches = search_similar(question, api_enabled=api_enabled)
+        # 学生端阈值固定为 0.60；管理员测试和 JSON 导入仍使用原全局阈值。
+        matches = search_similar(
+            question, top_k=1 if student else 5,
+            api_enabled=api_enabled, threshold=0.6 if student else None,
+        )
         if matches:
             best = matches[0]
             st.markdown("### 知识库回答")
             st.markdown(best["answer"])
-            st.caption(f"知识库匹配度：{best['score']:.0%}")
-            with st.expander("查看匹配到的知识库问题"):
-                st.write(best["question"])
+            st.caption(f"匹配问题：{best['question']} · 相似度：{best['score']:.0%}")
+            if student:
+                if st.button("不是我想要的答案", key=f"not_answer_{hash(question)}"):
+                    record_unanswered(question)
+                    st.success("已将你的问题提交给管理员待办，管理员确认后会补充正式答案。")
             return
+
         if student:
+            # 未达到学生端阈值时自动加入管理员待办；关闭 API 时不展示低相似度候选答案。
             record_unanswered(question)
+            if api_enabled:
+                with st.spinner("正在生成临时回答…"):
+                    answer = generate_answer(question, [], allow_free=True, api_enabled=True)
+                st.markdown("### 临时回答")
+                st.markdown(answer)
+                st.warning("临时回答，管理员待确认。问题已自动加入管理员待办。")
+            else:
+                st.warning("暂无答案匹配。")
+                st.info("问题已自动加入管理员待办，等待管理员补充正式答案。")
+            return
+
+        # 管理员测试端保留原来的行为。
         if api_enabled:
             with st.spinner("正在生成临时回答…"):
                 answer = generate_answer(question, [], allow_free=True, api_enabled=True)
             st.markdown("### 临时回答")
             st.markdown(answer)
-            st.info("该回答尚未经过管理员确认。问题已提交管理员处理。")
         else:
-            st.warning("知识库中暂时没有找到合适答案。")
-            st.info("问题已提交管理员待处理；当前已关闭方舟 API，不会调用向量或聊天接口。")
+            st.warning("知识库中暂时没有找到合适答案。当前已关闭方舟 API。")
     except Exception as exc:
         st.error(f"处理问题时发生错误：{exc}")
         st.caption("若已关闭 API，请检查本地向量模型依赖；开启 API 时请检查 Secrets 配置。")

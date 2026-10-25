@@ -218,7 +218,7 @@ def delete_qa(qid: int | str) -> None:
         pass
 
 
-def search_similar(query: str, top_k: int = 3, api_enabled: bool = True) -> list[dict[str, Any]]:
+def search_similar(query: str, top_k: int = 3, api_enabled: bool = True, threshold: float | None = None) -> list[dict[str, Any]]:
     if not query or not query.strip():
         return []
     target = api_collection if api_enabled else local_collection
@@ -239,7 +239,7 @@ def search_similar(query: str, top_k: int = 3, api_enabled: bool = True) -> list
         document = (result.get("documents") or [[]])[0][idx] or ""
         distance = (result.get("distances") or [[]])[0][idx]
         score = 1.0 - float(distance)
-        if score >= THRESHOLD:
+        if score >= (THRESHOLD if threshold is None else threshold):
             output.append({"id": qid, "question": document, "answer": metadata.get("answer", ""), "score": score})
     return output
 
@@ -272,11 +272,21 @@ def generate_answer(question: str, ctx_list: list[dict[str, Any]] | None, allow_
 
 
 def record_unanswered(question: str) -> None:
+    """加入管理员待办；同一问题已有待处理记录时不重复创建。"""
+    question = question.strip()
+    if not question:
+        return
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with _connect() as conn:
+        exists = conn.execute(
+            "SELECT id FROM unanswered WHERE question = ? AND status = 'pending' LIMIT 1",
+            (question,),
+        ).fetchone()
+        if exists:
+            return
         conn.execute(
             "INSERT INTO unanswered (question, status, created_at) VALUES (?, ?, ?)",
-            (question.strip(), "pending", now),
+            (question, "pending", now),
         )
 
 
