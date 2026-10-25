@@ -1,21 +1,21 @@
-"""SQLite + ChromaDB helpers for the Streamlit knowledge-base assistant."""
+"""Supabase PostgreSQL + persistent embedding storage helpers for Streamlit KB."""
 import json
+import math
 import os
-import sqlite3
-from datetime import datetime
-from pathlib import Path
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any
 
-import chromadb
 import httpx
+import psycopg2
+from psycopg2.extras import Json, RealDictCursor
 from dotenv import load_dotenv
 from openai import OpenAI
 
 load_dotenv()
 
-DB_PATH = os.getenv("DB_PATH", "data/assistant.db")
-CHROMA_DIR = os.getenv("CHROMA_DIR", "data/chroma")
-THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.50"))
+DB_URL = os.getenv("SUPABASE_DB_URL", "").strip()
+THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.70"))
 LLM_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 LLM_API_KEY = os.getenv("OPENAI_API_KEY", "")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
@@ -25,10 +25,27 @@ EMBED_DIMENSIONS = int(os.getenv("EMBED_DIMENSIONS")) if os.getenv("EMBED_DIMENS
 EMBED_INSTRUCTIONS = os.getenv("EMBED_INSTRUCTIONS", "")
 LOCAL_EMBED_MODEL = os.getenv("LOCAL_EMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
-# Avoid a network call at import time; the API key is checked when a request is made.
 client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY or "missing-api-key")
 _http = httpx.Client(timeout=45.0)
 _embedding_model = None
+
+
+def _connect():
+    if not DB_URL:
+        raise RuntimeError(
+            "未配置 SUPABASE_DB_URL。请在 Streamlit Cloud → Settings → Secrets 中添加 Supabase PostgreSQL 连接字符串。"
+        )
+    return psycopg2.connect(DB_URL, connect_timeout=15, cursor_factory=RealDictCursor, sslmode="require")
+
+
+@contextmanager
+def _db():
+    conn = _connect()
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def _get_local_embedding_model():
@@ -44,17 +61,14 @@ def _get_local_embedding_model():
 
 def _require_api_key() -> None:
     if not LLM_API_KEY:
-        raise RuntimeError("未配置 OPENAI_API_KEY。请在 .env 或 Streamlit Cloud Secrets 中设置模型 API 密钥。")
+        raise RuntimeError("未配置 OPENAI_API_KEY。请在 Streamlit Cloud Secrets 中设置模型 API 密钥。")
 
 
 def get_embedding(text: str, api_enabled: bool = True) -> list[float]:
     if not text or not text.strip():
         raise ValueError("向量化文本不能为空。")
-
-    # API 关闭时严格使用本地模型，不调用方舟向量 API。
     if not api_enabled or EMBED_PROVIDER == "local":
         return _get_local_embedding_model().encode(text, normalize_embeddings=True).tolist()
-
     _require_api_key()
     if EMBED_PROVIDER == "ark":
         payload: dict[str, Any] = {
@@ -73,175 +87,157 @@ def get_embedding(text: str, api_enabled: bool = True) -> list[float]:
         )
         response.raise_for_status()
         body = response.json()
-        # Support common response shape variants from compatible embedding providers.
-        if "data" in body and body["data"] and "embedding" in body["data"][0]:
+        if body.get("data") and isinstance(body["data"], list) and "embedding" in body["data"][0]:
             return body["data"][0]["embedding"]
-        if "data" in body and isinstance(body["data"].get("embedding"), list):
+        if isinstance(body.get("data", {}).get("embedding"), list):
             return body["data"]["embedding"]
         raise RuntimeError("向量接口返回格式不符合预期，请检查模型服务商文档。")
-
     if EMBED_PROVIDER in {"openai", "api"}:
         response = client.embeddings.create(
-            model=EMBED_MODEL,
-            input=text,
+            model=EMBED_MODEL, input=text,
             **({"dimensions": EMBED_DIMENSIONS} if EMBED_DIMENSIONS else {}),
         )
         return response.data[0].embedding
-
     raise ValueError("EMBED_PROVIDER 仅支持 openai、ark 或 local。")
 
 
-def _connect() -> sqlite3.Connection:
-    path = Path(DB_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def init_db() -> None:
-    with _connect() as conn:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS qa (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                question TEXT NOT NULL UNIQUE,
-                answer TEXT NOT NULL,
-                source TEXT,
-                created_at TEXT
-            )"""
-        )
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS unanswered (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                question TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )"""
-        )
-
+    """Create tables if missing. Never drops or truncates existing data."""
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS qa (
+                    id BIGSERIAL PRIMARY KEY,
+                    question TEXT NOT NULL UNIQUE,
+                    answer TEXT NOT NULL,
+                    source TEXT,
+                    created_at TEXT,
+                    embedding_api JSONB,
+                    embedding_local JSONB
+                )
+            """)
+            cur.execute("ALTER TABLE qa ADD COLUMN IF NOT EXISTS embedding_api JSONB")
+            cur.execute("ALTER TABLE qa ADD COLUMN IF NOT EXISTS embedding_local JSONB")
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS unanswered (
+                    id BIGSERIAL PRIMARY KEY,
+                    question TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
 
 
 def get_api_enabled() -> bool:
-    """站点级 API 开关，存储于 SQLite，所有访客共用。"""
-    with _connect() as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        row = conn.execute("SELECT value FROM app_settings WHERE key='api_enabled'").fetchone()
-        if row is None:
-            conn.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('api_enabled', '1')")
-            return True
-        return row["value"] == "1"
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO app_settings (key, value) VALUES ('api_enabled', '1') ON CONFLICT (key) DO NOTHING")
+            cur.execute("SELECT value FROM app_settings WHERE key = 'api_enabled'")
+            row = cur.fetchone()
+    return bool(row and row["value"] == "1")
 
 
 def set_api_enabled(enabled: bool) -> None:
-    with _connect() as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        conn.execute(
-            "INSERT INTO app_settings (key, value) VALUES ('api_enabled', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            ("1" if enabled else "0",),
-        )
-
-
-def _get_collection(name: str):
-    os.makedirs(CHROMA_DIR, exist_ok=True)
-    chroma_client = chromadb.PersistentClient(path=CHROMA_DIR)
-    try:
-        return chroma_client.get_collection(name=name)
-    except Exception:
-        return chroma_client.create_collection(name=name, metadata={"hnsw:space": "cosine"})
-
-
-api_collection = _get_collection("qa_collection")
-local_collection = _get_collection("qa_local_collection")
-
-
-def _sync_local_index() -> None:
-    """从 SQLite 补齐本地向量索引，确保关闭 API 后也能检索原知识库。"""
-    with _connect() as conn:
-        rows = conn.execute("SELECT id, question, answer FROM qa ORDER BY id").fetchall()
-    existing = set(local_collection.get(include=[])["ids"])
-    for row in rows:
-        qid = str(row["id"])
-        if qid not in existing:
-            vector = get_embedding(row["question"], api_enabled=False)
-            local_collection.upsert(
-                ids=[qid], embeddings=[vector], documents=[row["question"]],
-                metadatas=[{"answer": row["answer"]}],
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO app_settings (key, value) VALUES ('api_enabled', %s) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                ("1" if enabled else "0",),
             )
 
 
-def _upsert_vector(qid: int | str, question: str, answer: str, api_enabled: bool = True) -> None:
-    vector = get_embedding(question, api_enabled=api_enabled)
-    target = api_collection if api_enabled else local_collection
-    target.upsert(ids=[str(qid)], embeddings=[vector], documents=[question], metadatas=[{"answer": answer}])
+def _embedding_column(api_enabled: bool) -> str:
+    return "embedding_api" if api_enabled and EMBED_PROVIDER != "local" else "embedding_local"
+
+
+def _ensure_embedding(row: dict[str, Any], api_enabled: bool) -> list[float]:
+    col = _embedding_column(api_enabled)
+    vector = row.get(col)
+    if vector:
+        return [float(v) for v in vector]
+    vector = get_embedding(row["question"], api_enabled=api_enabled)
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE qa SET {col} = %s WHERE id = %s AND {col} IS NULL", (Json(vector), row["id"]))
+    return vector
+
+
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return -1.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0 or nb == 0:
+        return -1.0
+    return dot / (na * nb)
 
 
 def add_qa(question: str, answer: str, source: str = "manual", api_enabled: bool = True) -> int:
     question, answer = question.strip(), answer.strip()
     if not question or not answer:
         raise ValueError("问题和答案不能为空。")
+    vector = get_embedding(question, api_enabled=api_enabled)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with _connect() as conn:
-        existing = conn.execute("SELECT id FROM qa WHERE question = ?", (question,)).fetchone()
-        if existing:
-            raise ValueError("该问题已存在于知识库中。")
-        cursor = conn.execute(
-            "INSERT INTO qa (question, answer, source, created_at) VALUES (?, ?, ?, ?)",
-            (question, answer, source, now),
-        )
-        qid = int(cursor.lastrowid)
-    try:
-        _upsert_vector(qid, question, answer, api_enabled=api_enabled)
-    except Exception:
-        # Keep SQLite and Chroma in sync if embedding/vector storage fails.
-        with _connect() as conn:
-            conn.execute("DELETE FROM qa WHERE id = ?", (qid,))
-        raise
-    return qid
+    col = _embedding_column(api_enabled)
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM qa WHERE question = %s", (question,))
+            if cur.fetchone():
+                raise ValueError("该问题已存在于知识库中。")
+            if col == "embedding_api":
+                cur.execute(
+                    "INSERT INTO qa (question, answer, source, created_at, embedding_api) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                    (question, answer, source, now, Json(vector)),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO qa (question, answer, source, created_at, embedding_local) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                    (question, answer, source, now, Json(vector)),
+                )
+            return int(cur.fetchone()["id"])
 
 
 def get_all_qa() -> list[dict[str, Any]]:
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT id, question, answer, source, created_at FROM qa ORDER BY id DESC"
-        ).fetchall()
-    return [dict(row) for row in rows]
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, question, answer, source, created_at FROM qa ORDER BY id DESC")
+            return [dict(row) for row in cur.fetchall()]
 
 
 def delete_qa(qid: int | str) -> None:
-    with _connect() as conn:
-        conn.execute("DELETE FROM qa WHERE id = ?", (qid,))
-    try:
-        collection.delete(ids=[str(qid)])
-    except Exception:
-        # A missing vector can occur after an interrupted import; the SQL deletion still stands.
-        pass
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM qa WHERE id = %s", (qid,))
 
 
 def search_similar(query: str, top_k: int = 3, api_enabled: bool = True, threshold: float | None = None) -> list[dict[str, Any]]:
     if not query or not query.strip():
         return []
-    target = api_collection if api_enabled else local_collection
-    if not api_enabled:
-        _sync_local_index()
-    total = target.count()
-    if total == 0:
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, question, answer, source, created_at, embedding_api, embedding_local FROM qa")
+            rows = [dict(row) for row in cur.fetchall()]
+    if not rows:
         return []
-    embedding = get_embedding(query.strip(), api_enabled=api_enabled)
-    result = target.query(
-        query_embeddings=[embedding], n_results=min(max(1, top_k), total),
-        include=["distances", "documents", "metadatas"],
-    )
+    query_vector = get_embedding(query.strip(), api_enabled=api_enabled)
+    cutoff = THRESHOLD if threshold is None else threshold
     output = []
-    ids = (result.get("ids") or [[]])[0]
-    for idx, qid in enumerate(ids):
-        metadata = (result.get("metadatas") or [[]])[0][idx] or {}
-        document = (result.get("documents") or [[]])[0][idx] or ""
-        distance = (result.get("distances") or [[]])[0][idx]
-        score = 1.0 - float(distance)
-        if score >= (THRESHOLD if threshold is None else threshold):
-            output.append({"id": qid, "question": document, "answer": metadata.get("answer", ""), "score": score})
-    return output
+    col = _embedding_column(api_enabled)
+    for row in rows:
+        vector = _ensure_embedding(row, api_enabled)
+        score = _cosine_similarity(query_vector, vector)
+        if score >= cutoff:
+            output.append({"id": str(row["id"]), "question": row["question"], "answer": row["answer"], "score": score})
+    output.sort(key=lambda item: item["score"], reverse=True)
+    return output[:max(1, int(top_k))]
 
 
 def generate_answer(question: str, ctx_list: list[dict[str, Any]] | None, allow_free: bool = False, api_enabled: bool = True) -> str:
@@ -259,7 +255,6 @@ def generate_answer(question: str, ctx_list: list[dict[str, Any]] | None, allow_
         )
     else:
         return "知识库中没有相关内容。"
-
     if not api_enabled:
         return "知识库未命中；当前 API 已关闭，问题应交由管理员处理。"
     _require_api_key()
@@ -272,54 +267,59 @@ def generate_answer(question: str, ctx_list: list[dict[str, Any]] | None, allow_
 
 
 def record_unanswered(question: str) -> None:
-    """加入管理员待办；同一问题已有待处理记录时不重复创建。"""
     question = question.strip()
     if not question:
         return
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with _connect() as conn:
-        exists = conn.execute(
-            "SELECT id FROM unanswered WHERE question = ? AND status = 'pending' LIMIT 1",
-            (question,),
-        ).fetchone()
-        if exists:
-            return
-        conn.execute(
-            "INSERT INTO unanswered (question, status, created_at) VALUES (?, ?, ?)",
-            (question, "pending", now),
-        )
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM unanswered WHERE question = %s AND status = 'pending' LIMIT 1", (question,))
+            if cur.fetchone():
+                return
+            cur.execute(
+                "INSERT INTO unanswered (question, status, created_at) VALUES (%s, 'pending', %s)",
+                (question, now),
+            )
 
 
 def get_unanswered(status: str = "pending") -> list[dict[str, Any]]:
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT id, question, created_at FROM unanswered WHERE status = ? ORDER BY id DESC",
-            (status,),
-        ).fetchall()
-    return [dict(row) for row in rows]
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, question, created_at FROM unanswered WHERE status = %s ORDER BY id DESC", (status,))
+            return [dict(row) for row in cur.fetchall()]
+
+
+def get_all_unanswered() -> list[dict[str, Any]]:
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, question, status, created_at FROM unanswered ORDER BY id DESC")
+            return [dict(row) for row in cur.fetchall()]
 
 
 def resolve_unanswered(uid: int | str, answer: str, api_enabled: bool = True) -> None:
-    with _connect() as conn:
-        row = conn.execute("SELECT question FROM unanswered WHERE id = ?", (uid,)).fetchone()
-        if not row:
-            raise ValueError("待处理问题不存在。")
-        question = row["question"]
-    add_qa(question, answer, source="unanswered_review", api_enabled=api_enabled)
-    with _connect() as conn:
-        conn.execute("UPDATE unanswered SET status = 'resolved' WHERE id = ?", (uid,))
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT question FROM unanswered WHERE id = %s", (uid,))
+            row = cur.fetchone()
+    if not row:
+        raise ValueError("待处理问题不存在。")
+    add_qa(row["question"], answer, source="unanswered_review", api_enabled=api_enabled)
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE unanswered SET status = 'resolved' WHERE id = %s", (uid,))
 
 
 def ignore_unanswered(uid: int | str) -> None:
-    with _connect() as conn:
-        conn.execute("UPDATE unanswered SET status = 'ignored' WHERE id = ?", (uid,))
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE unanswered SET status = 'ignored' WHERE id = %s", (uid,))
 
 
 def import_records(json_list: list[dict[str, Any]], api_enabled: bool = True) -> int:
     count = 0
     for item in json_list:
-        question = str(item.get("question", "")).strip()
-        answer = str(item.get("answer", "")).strip()
+        question = str(item.get("question", item.get("问题", ""))).strip()
+        answer = str(item.get("answer", item.get("答案", ""))).strip()
         if not question or not answer:
             continue
         try:
@@ -332,12 +332,13 @@ def import_records(json_list: list[dict[str, Any]], api_enabled: bool = True) ->
 
 
 def load_json_to_kb(json_path: str, api_enabled: bool = True) -> int:
-    """Import JSON question-answer pairs, skipping existing questions."""
-    path = Path(json_path)
+    path = __import__("pathlib").Path(json_path)
     if not path.is_file():
         raise FileNotFoundError(f"找不到 JSON 文件：{path}")
     with path.open("r", encoding="utf-8") as file:
         data = json.load(file)
+    if isinstance(data, dict):
+        data = data.get("knowledge_base", data.get("data", data.get("qa", data.get("items", data))))
     if not isinstance(data, list):
-        raise ValueError("JSON 顶层格式必须是问答数组。")
+        raise ValueError("JSON 顶层格式必须是问答数组，或包含 knowledge_base/data/qa/items 数组的对象。")
     return import_records(data, api_enabled=api_enabled)

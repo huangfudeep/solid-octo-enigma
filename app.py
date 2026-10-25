@@ -15,7 +15,7 @@ try:
         "OPENAI_API_KEY", "OPENAI_BASE_URL", "CHAT_MODEL", "EMBED_PROVIDER",
         "EMBED_MODEL", "EMBED_DIMENSIONS", "EMBED_INSTRUCTIONS",
         "LOCAL_EMBED_MODEL", "SIMILARITY_THRESHOLD", "DB_PATH", "CHROMA_DIR",
-        "ADMIN_PASSWORD",
+        "SUPABASE_DB_URL", "ADMIN_PASSWORD",
     ):
         if _key in st.secrets and _key not in os.environ:
             os.environ[_key] = str(st.secrets[_key])
@@ -31,6 +31,7 @@ from db_utils import (
     get_all_qa,
     get_api_enabled,
     get_unanswered,
+    get_all_unanswered,
     ignore_unanswered,
     init_db,
     load_json_to_kb,
@@ -238,6 +239,26 @@ elif st.session_state.role == "admin":
                         st.rerun()
 
     with tab_kb:
+        st.subheader("📦 数据备份与导出")
+        import json
+        from datetime import datetime, timezone
+        backup_payload = {
+            "backup_format": "streamlit_qa_backup_v1",
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "knowledge_base": get_all_qa(),
+            "unanswered_questions": get_all_unanswered(),
+            "settings": {"api_enabled": get_api_enabled()},
+        }
+        st.download_button(
+            "⬇️ 一键导出 JSON 完整备份",
+            data=json.dumps(backup_payload, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name=f"qa_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            use_container_width=True,
+            help="备份包含知识库问答、待处理问题记录和 API 开关状态。API 密钥及管理员密码不会被导出。",
+        )
+        st.caption("建议定期下载并妥善保存备份文件；导出的 JSON 可用于恢复知识库问答。")
+        st.divider()
         st.subheader("新增知识库条目")
         with st.form("add_qa_form", clear_on_submit=True):
             question_add = st.text_input("问题")
@@ -270,7 +291,7 @@ elif st.session_state.role == "admin":
                 parsed = json.loads(uploaded_json.getvalue().decode("utf-8-sig"))
                 if isinstance(parsed, dict):
                     # Also accept common wrapper formats such as {"data": [...]}.
-                    parsed = parsed.get("data", parsed.get("qa", parsed.get("items", parsed)))
+                    parsed = parsed.get("knowledge_base", parsed.get("data", parsed.get("qa", parsed.get("items", parsed))))
                 if not isinstance(parsed, list):
                     st.error("JSON 格式不正确：顶层必须是问答数组，或包含 data/qa/items 数组的对象。")
                 else:
