@@ -15,7 +15,7 @@ load_dotenv()
 
 DB_PATH = os.getenv("DB_PATH", "data/assistant.db")
 CHROMA_DIR = os.getenv("CHROMA_DIR", "data/chroma")
-THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.70"))
+THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.50"))
 LLM_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 LLM_API_KEY = os.getenv("OPENAI_API_KEY", "")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
