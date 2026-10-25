@@ -82,10 +82,9 @@ def answer_question(question: str, *, student: bool) -> None:
             st.markdown("### 知识库回答")
             st.markdown(best["answer"])
             st.caption(f"匹配问题：{best['question']} · 相似度：{best['score']:.0%}")
+            # 按钮由学生端在提交后持续渲染；若放在表单提交分支内，点击按钮触发 rerun 后会消失。
             if student:
-                if st.button("不是我想要的答案", key=f"not_answer_{hash(question)}"):
-                    record_unanswered(question)
-                    st.success("已将你的问题提交给管理员待办，管理员确认后会补充正式答案。")
+                st.session_state["last_matched_student_question"] = question
             return
 
         if student:
@@ -162,9 +161,22 @@ elif st.session_state.role == "student":
         submitted = st.form_submit_button("提交提问", type="primary")
     if submitted:
         if question.strip():
+            st.session_state["last_student_question"] = question.strip()
+            st.session_state.pop("last_matched_student_question", None)
             answer_question(question.strip(), student=True)
         else:
             st.warning("请先输入问题。")
+    elif st.session_state.get("last_student_question"):
+        # 维持最近一次结果和反馈按钮，避免 Streamlit rerun 后按钮消失。
+        answer_question(st.session_state["last_student_question"], student=True)
+
+    matched_question = st.session_state.get("last_matched_student_question")
+    if matched_question:
+        if st.button("不是我想要的答案", key="not_answer_feedback"):
+            record_unanswered(matched_question)
+            st.session_state["last_matched_student_question"] = None
+            st.success("已将你的问题提交给管理员待办，管理员确认后会补充正式答案。")
+
     st.sidebar.info("学生端：仅可提问和查看答案")
     if st.sidebar.button("退出并返回首页"):
         logout()
