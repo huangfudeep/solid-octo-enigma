@@ -175,15 +175,6 @@ def _upsert_vector(qid: int | str, question: str, answer: str, api_enabled: bool
     target = api_collection if api_enabled else local_collection
     target.upsert(ids=[str(qid)], embeddings=[vector], documents=[question], metadatas=[{"answer": answer}])
 
-def _upsert_vector(qid: int | str, question: str, answer: str) -> None:
-    embedding = get_embedding(question)
-    collection.upsert(
-        ids=[str(qid)],
-        embeddings=[embedding],
-        documents=[question],
-        metadatas=[{"answer": answer}],
-    )
-
 
 def add_qa(question: str, answer: str, source: str = "manual", api_enabled: bool = True) -> int:
     question, answer = question.strip(), answer.strip()

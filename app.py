@@ -225,17 +225,102 @@ elif st.session_state.role == "admin":
                 st.warning("问题和答案均不能为空。")
 
         st.divider()
-        st.subheader("批量导入示例题库")
-        if st.button("📥 一键导入 sample_qa.json"):
-            if not SAMPLE_JSON.exists():
-                st.error(f"找不到文件：{SAMPLE_JSON.name}。请确认该文件已和 app.py 一起部署。")
-            else:
-                try:
-                    count = load_json_to_kb(str(SAMPLE_JSON), api_enabled=get_api_enabled())
-                    st.success(f"导入完成！新增 {count} 条问答，重复的问题会自动跳过。")
-                    st.rerun()
-                except Exception as exc:
-                    st.error(f"导入失败：{exc}")
+        st.subheader("📂 上传本地 JSON 问答库")
+        st.caption("支持拖拽或选择 .json 文件。系统会自动跳过问答完全一致的重复项，并列出相似问题供管理员确认。")
+        uploaded_json = st.file_uploader("拖动 JSON 文件到此处，或点击选择文件", type=["json"], key="json_kb_uploader")
+        use_model_for_import = st.checkbox(
+            "本次导入使用方舟 API 向量检索（关闭则使用本地模型）",
+            value=get_api_enabled(),
+            help="开启会调用已配置的方舟向量 API；关闭时不调用方舟 API。若本地模型首次运行，会下载模型文件。",
+            key="json_import_use_api",
+        )
+        if uploaded_json is not None:
+            import json
+            try:
+                parsed = json.loads(uploaded_json.getvalue().decode("utf-8-sig"))
+                if isinstance(parsed, dict):
+                    # Also accept common wrapper formats such as {"data": [...]}.
+                    parsed = parsed.get("data", parsed.get("qa", parsed.get("items", parsed)))
+                if not isinstance(parsed, list):
+                    st.error("JSON 格式不正确：顶层必须是问答数组，或包含 data/qa/items 数组的对象。")
+                else:
+                    clean_records = []
+                    for idx, row in enumerate(parsed, start=1):
+                        if not isinstance(row, dict):
+                            continue
+                        q = str(row.get("question", row.get("问题", ""))).strip()
+                        a = str(row.get("answer", row.get("答案", ""))).strip()
+                        if q and a:
+                            clean_records.append({"question": q, "answer": a, "row_num": idx})
+                    if not clean_records:
+                        st.warning("文件中没有识别到有效的 question/answer（或 问题/答案）字段。")
+                    else:
+                        existing = get_all_qa()
+                        exact_pairs = {(x["question"].strip(), x["answer"].strip()) for x in existing}
+                        existing_questions = {x["question"].strip() for x in existing}
+                        new_records = []
+                        exact_skipped = 0
+                        for record in clean_records:
+                            pair = (record["question"], record["answer"])
+                            if pair in exact_pairs:
+                                exact_skipped += 1
+                                continue
+                            # Duplicate pairs inside the uploaded file are also skipped.
+                            if pair in {(x["question"], x["answer"]) for x in new_records}:
+                                exact_skipped += 1
+                                continue
+                            new_records.append(record)
+                        st.info(f"识别到 {len(clean_records)} 条有效问答；完全一致的重复项将自动跳过：{exact_skipped} 条。")
+                        if new_records:
+                            st.write("**相似项检查（相似问题会列出已有答案，导入前请确认）**")
+                            reviewed = []
+                            for i, record in enumerate(new_records):
+                                q, a = record["question"], record["answer"]
+                                same_question = next((x for x in existing if x["question"].strip() == q), None)
+                                try:
+                                    similar = search_similar(q, top_k=3, api_enabled=use_model_for_import)
+                                except Exception as exc:
+                                    similar = []
+                                    st.warning(f"第 {record['row_num']} 条相似检索失败：{exc}")
+                                # Exact question + exact answer is already skipped; same question but different answer requires human review.
+                                with st.expander(f"第 {record['row_num']} 条：{q}", expanded=bool(same_question or similar)):
+                                    st.markdown("**上传文件中的答案**")
+                                    st.write(a)
+                                    if same_question:
+                                        st.warning("知识库已有完全相同的问题，但答案不同，请重点确认。")
+                                        st.markdown("**本地库已有答案**")
+                                        st.write(same_question["answer"])
+                                    else:
+                                        candidates = [m for m in similar if m.get("question", "").strip() != q]
+                                        if candidates:
+                                            st.markdown("**本地库相似问题与已有回答（供确认）**")
+                                            for m in candidates:
+                                                st.write(f"相似度 {m.get('score', 0):.0%} · {m['question']}")
+                                                st.write(m["answer"])
+                                        else:
+                                            st.caption("未检索到明显相似项。")
+                                    checked = st.checkbox("确认导入此条", value=not bool(same_question), key=f"json_import_{uploaded_json.name}_{i}")
+                                    reviewed.append((record, checked, same_question))
+                            if st.button("✅ 导入已确认问答", type="primary", key="confirm_json_import"):
+                                imported, skipped_conflict, errors = 0, 0, []
+                                for record, checked, same_question in reviewed:
+                                    if not checked:
+                                        skipped_conflict += 1
+                                        continue
+                                    try:
+                                        # Existing question with different answer must not silently overwrite the knowledge base.
+                                        add_qa(record["question"], record["answer"], source=f"json_import:{uploaded_json.name}", api_enabled=use_model_for_import)
+                                        imported += 1
+                                    except Exception as exc:
+                                        errors.append(f"{record['question']}：{exc}")
+                                st.success(f"导入完成：新增 {imported} 条；未勾选/待确认 {skipped_conflict} 条；自动跳过完全重复 {exact_skipped} 条。")
+                                if errors:
+                                    st.warning("以下项目未能导入：\n" + "\n".join(errors[:10]))
+                                st.rerun()
+                        else:
+                            st.success("文件中的问答都已存在且完全一致，无需重复导入。")
+            except Exception as exc:
+                st.error(f"无法读取 JSON：{exc}")
 
         st.subheader("现有知识库")
         all_items = get_all_qa()
