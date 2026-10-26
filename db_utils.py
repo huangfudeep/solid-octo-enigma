@@ -15,17 +15,38 @@ from openai import OpenAI
 
 load_dotenv()
 
-# Read the database URL at connection time, not only at module import time.
-# This is more robust when Streamlit Cloud Secrets are not exported to os.environ.
-def _get_db_url() -> str:
+# Read Supabase configuration from Streamlit Secrets first, then environment variables.
+# Supports either a full SUPABASE_DB_URL or the split DB_HOST/PORT/NAME/USER/PASSWORD keys.
+def _secret_value(name: str, default: str = "") -> str:
     try:
-        value = st.secrets.get("SUPABASE_DB_URL", None)
+        value = st.secrets.get(name, None)
         if value is not None and str(value).strip():
             return str(value).strip()
     except Exception:
         # Local runs without .streamlit/secrets.toml are supported.
         pass
-    return os.getenv("SUPABASE_DB_URL", "").strip()
+    return os.getenv(name, default).strip()
+
+
+def _get_db_url() -> str:
+    value = _secret_value("SUPABASE_DB_URL")
+    if value:
+        return value
+
+    host = _secret_value("SUPABASE_DB_HOST")
+    port = _secret_value("SUPABASE_DB_PORT", "5432")
+    dbname = _secret_value("SUPABASE_DB_NAME", "postgres")
+    user = _secret_value("SUPABASE_DB_USER")
+    password = _secret_value("SUPABASE_DB_PASSWORD")
+    if host and user and password:
+        from urllib.parse import quote
+        return (
+            f"postgresql://{quote(user, safe='')}:{quote(password, safe='')}"
+            f"@{host}:{port}/{quote(dbname, safe='')}"
+        )
+    return ""
+
+
 THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.70"))
 LLM_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 LLM_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -42,13 +63,17 @@ _http = httpx.Client(timeout=45.0)
 
 def _connect():
     db_url = _get_db_url()
-    if not db_url:
-        # Do not reveal credentials; provide a clear, actionable diagnostic.
-        raise RuntimeError(
-            "未读取到 SUPABASE_DB_URL。请确认 Streamlit Cloud → App → Settings → Secrets 中的键名准确为 SUPABASE_DB_URL，"
-            "且其值是完整的 PostgreSQL URI（postgresql://...）。保存后请 Reboot 应用。"
+    if db_url:
+        return psycopg2.connect(
+            db_url, connect_timeout=15, cursor_factory=RealDictCursor, sslmode="require"
         )
-    return psycopg2.connect(db_url, connect_timeout=15, cursor_factory=RealDictCursor, sslmode="require")
+
+    # No full URL and incomplete split credentials: fail without exposing secrets.
+    raise RuntimeError(
+        "未读取到完整的 Supabase 数据库配置。请在 Streamlit Cloud → App → Settings → Secrets "
+        "中设置 SUPABASE_DB_URL，或同时设置 SUPABASE_DB_HOST、SUPABASE_DB_PORT、"
+        "SUPABASE_DB_NAME、SUPABASE_DB_USER、SUPABASE_DB_PASSWORD。"
+    )
 
 
 @contextmanager
