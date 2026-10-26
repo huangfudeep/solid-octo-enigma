@@ -15,7 +15,17 @@ from openai import OpenAI
 
 load_dotenv()
 
-DB_URL = os.getenv("SUPABASE_DB_URL", "").strip()
+# Read the database URL at connection time, not only at module import time.
+# This is more robust when Streamlit Cloud Secrets are not exported to os.environ.
+def _get_db_url() -> str:
+    try:
+        value = st.secrets.get("SUPABASE_DB_URL", None)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    except Exception:
+        # Local runs without .streamlit/secrets.toml are supported.
+        pass
+    return os.getenv("SUPABASE_DB_URL", "").strip()
 THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.70"))
 LLM_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 LLM_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -31,11 +41,14 @@ _http = httpx.Client(timeout=45.0)
 
 
 def _connect():
-    if not DB_URL:
+    db_url = _get_db_url()
+    if not db_url:
+        # Do not reveal credentials; provide a clear, actionable diagnostic.
         raise RuntimeError(
-            "未配置 SUPABASE_DB_URL。请在 Streamlit Cloud → Settings → Secrets 中添加 Supabase PostgreSQL 连接字符串。"
+            "未读取到 SUPABASE_DB_URL。请确认 Streamlit Cloud → App → Settings → Secrets 中的键名准确为 SUPABASE_DB_URL，"
+            "且其值是完整的 PostgreSQL URI（postgresql://...）。保存后请 Reboot 应用。"
         )
-    return psycopg2.connect(DB_URL, connect_timeout=15, cursor_factory=RealDictCursor, sslmode="require")
+    return psycopg2.connect(db_url, connect_timeout=15, cursor_factory=RealDictCursor, sslmode="require")
 
 
 @contextmanager
