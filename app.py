@@ -1,6 +1,12 @@
 from pathlib import Path
 import os
 
+# Keep CPU libraries from creating large thread pools on memory-limited hosting.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TORCH_NUM_THREADS", "1")
+
 import streamlit as st
 from dotenv import load_dotenv
 

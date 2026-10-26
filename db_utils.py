@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 import psycopg2
+import streamlit as st
 from psycopg2.extras import Json, RealDictCursor
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -15,13 +16,6 @@ from openai import OpenAI
 load_dotenv()
 
 DB_URL = os.getenv("SUPABASE_DB_URL", "").strip()
-# Optional split connection settings avoid URL parsing issues when passwords contain
-# reserved characters such as @, :, /, #, or brackets.
-DB_HOST = os.getenv("SUPABASE_DB_HOST", "").strip()
-DB_PORT = os.getenv("SUPABASE_DB_PORT", "5432").strip()
-DB_NAME = os.getenv("SUPABASE_DB_NAME", "postgres").strip()
-DB_USER = os.getenv("SUPABASE_DB_USER", "").strip()
-DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD", "")
 THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.70"))
 LLM_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 LLM_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -34,26 +28,12 @@ LOCAL_EMBED_MODEL = os.getenv("LOCAL_EMBED_MODEL", "sentence-transformers/paraph
 
 client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY or "missing-api-key")
 _http = httpx.Client(timeout=45.0)
-_embedding_model = None
 
 
 def _connect():
-    # Prefer discrete settings: psycopg2 receives the password as a separate value,
-    # so special characters do not get misinterpreted as URL delimiters.
-    if DB_HOST and DB_USER and DB_PASSWORD:
-        return psycopg2.connect(
-            host=DB_HOST,
-            port=int(DB_PORT or "5432"),
-            dbname=DB_NAME or "postgres",
-            user=DB_USER,
-            password=DB_PASSWORD,
-            connect_timeout=15,
-            cursor_factory=RealDictCursor,
-            sslmode="require",
-        )
     if not DB_URL:
         raise RuntimeError(
-            "未配置数据库连接信息。请在 Streamlit Cloud → Settings → Secrets 中设置 SUPABASE_DB_HOST、SUPABASE_DB_USER、SUPABASE_DB_PASSWORD 等字段，或设置 SUPABASE_DB_URL。"
+            "未配置 SUPABASE_DB_URL。请在 Streamlit Cloud → Settings → Secrets 中添加 Supabase PostgreSQL 连接字符串。"
         )
     return psycopg2.connect(DB_URL, connect_timeout=15, cursor_factory=RealDictCursor, sslmode="require")
 
@@ -68,15 +48,21 @@ def _db():
         conn.close()
 
 
-def _get_local_embedding_model():
-    global _embedding_model
-    if _embedding_model is None:
+@st.cache_resource(show_spinner="正在加载本地语义模型…")
+def _get_local_embedding_model(model_name: str):
+    """Cache one model process-wide across Streamlit reruns/sessions."""
+    try:
+        # Limit CPU thread pools on small Streamlit Cloud instances.
+        import torch
+        torch.set_num_threads(max(1, int(os.getenv("TORCH_NUM_THREADS", "1"))))
         try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError as exc:
-            raise RuntimeError("本地向量模型需要安装 sentence-transformers。") from exc
-        _embedding_model = SentenceTransformer(LOCAL_EMBED_MODEL)
-    return _embedding_model
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass  # PyTorch may already have initialized its inter-op pool.
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:
+        raise RuntimeError("本地向量模型需要安装 sentence-transformers。") from exc
+    return SentenceTransformer(model_name, device="cpu")
 
 
 def _require_api_key() -> None:
@@ -88,7 +74,12 @@ def get_embedding(text: str, api_enabled: bool = True) -> list[float]:
     if not text or not text.strip():
         raise ValueError("向量化文本不能为空。")
     if not api_enabled or EMBED_PROVIDER == "local":
-        return _get_local_embedding_model().encode(text, normalize_embeddings=True).tolist()
+        model = _get_local_embedding_model(LOCAL_EMBED_MODEL)
+        vector = model.encode(
+            text, normalize_embeddings=True, convert_to_numpy=True,
+            show_progress_bar=False, batch_size=1,
+        )
+        return vector.tolist()
     _require_api_key()
     if EMBED_PROVIDER == "ark":
         payload: dict[str, Any] = {
@@ -239,25 +230,80 @@ def delete_qa(qid: int | str) -> None:
 
 
 def search_similar(query: str, top_k: int = 3, api_enabled: bool = True, threshold: float | None = None) -> list[dict[str, Any]]:
+    """Bounded-memory cosine search. Fetch only the active embedding column in small batches.
+
+    For local mode, missing vectors are encoded in small batches and persisted, avoiding one
+    model inference per row. Results preserve the existing threshold/top-k behavior.
+    """
     if not query or not query.strip():
         return []
-    with _db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, question, answer, source, created_at, embedding_api, embedding_local FROM qa")
-            rows = [dict(row) for row in cur.fetchall()]
-    if not rows:
-        return []
+
     query_vector = get_embedding(query.strip(), api_enabled=api_enabled)
     cutoff = THRESHOLD if threshold is None else threshold
-    output = []
+    batch_size = max(25, min(100, int(os.getenv("SEARCH_BATCH_SIZE", "50"))))
+    top_n = max(1, int(top_k))
     col = _embedding_column(api_enabled)
-    for row in rows:
-        vector = _ensure_embedding(row, api_enabled)
-        score = _cosine_similarity(query_vector, vector)
-        if score >= cutoff:
-            output.append({"id": str(row["id"]), "question": row["question"], "answer": row["answer"], "score": score})
-    output.sort(key=lambda item: item["score"], reverse=True)
-    return output[:max(1, int(top_k))]
+    best: list[dict[str, Any]] = []
+    offset = 0
+
+    while True:
+        # Do not fetch both API and local vectors: JSONB vectors add significant transient memory.
+        with _db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT id, question, answer, {col} AS embedding FROM qa ORDER BY id LIMIT %s OFFSET %s",
+                    (batch_size, offset),
+                )
+                rows = [dict(row) for row in cur.fetchall()]
+        if not rows:
+            break
+
+        missing = [row for row in rows if not row.get("embedding")]
+        if missing and col == "embedding_local":
+            model = _get_local_embedding_model(LOCAL_EMBED_MODEL)
+            vectors = model.encode(
+                [row["question"] for row in missing],
+                batch_size=8, normalize_embeddings=True, convert_to_numpy=True,
+                show_progress_bar=False,
+            )
+            updates = []
+            for row, vector in zip(missing, vectors):
+                row["embedding"] = vector.tolist()
+                updates.append((Json(row["embedding"]), row["id"]))
+            if updates:
+                with _db() as conn:
+                    with conn.cursor() as cur:
+                        cur.executemany(
+                            "UPDATE qa SET embedding_local = %s WHERE id = %s AND embedding_local IS NULL",
+                            updates,
+                        )
+        elif missing:
+            # API mode only computes missing embeddings; local-model memory remains untouched.
+            for row in missing:
+                row["embedding"] = get_embedding(row["question"], api_enabled=api_enabled)
+                with _db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"UPDATE qa SET {col} = %s WHERE id = %s AND {col} IS NULL",
+                            (Json(row["embedding"]), row["id"]),
+                        )
+
+        for row in rows:
+            vector = row.get("embedding")
+            if not vector:
+                continue
+            score = _cosine_similarity(query_vector, [float(v) for v in vector])
+            if score >= cutoff:
+                best.append({
+                    "id": str(row["id"]), "question": row["question"],
+                    "answer": row["answer"], "score": score,
+                })
+        best.sort(key=lambda item: item["score"], reverse=True)
+        del rows, missing
+        best = best[:top_n]
+        offset += batch_size
+
+    return best
 
 
 def generate_answer(question: str, ctx_list: list[dict[str, Any]] | None, allow_free: bool = False, api_enabled: bool = True) -> str:
